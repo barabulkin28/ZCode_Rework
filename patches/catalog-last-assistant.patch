@@ -1,0 +1,664 @@
+--- a/apps/zcode-cli/docs/design/v2/session-persistence.md
++++ b/apps/zcode-cli/docs/design/v2/session-persistence.md
+@@ -642,6 +642,8 @@
+   removePart(input: { sessionID: SessionID; messageID: MessageID; partID: PartID }): Promise<void>;
+ 
+   messages(input: { sessionID: SessionID }): Promise<MessageWithParts[]>;
++  /** 子代理列表/状态只读：按 messages 反序取最新 assistant 及其 part；无 assistant 为 null。 */
++  lastAssistantMessage(input: { sessionID: SessionID }): Promise<MessageWithParts | null>;
+ 
+   setRevert(input: {
+     sessionID: SessionID;
+@@ -653,6 +655,20 @@
+ ```
+ 
+ 业务层只依赖这个接口，不直接碰 SQLite、fs 或具体 ORM。
++
++### 最新 assistant 单条读取（子代理列表）
++
++`lastAssistantMessage` 是子代理目录/状态的专用读入口，不是模型恢复入口：
++
++- SQL 只按 `session_id` 和 `json_extract(data, '$.role') = 'assistant'` 选一条 id，排序为
++  `sequence is null desc, sequence desc, time_created desc, rowid desc limit 1`，即 `messages`
++  读取顺序的精确反序；末尾的 user、错误、工具、stream recovery 或大文本消息都不会改变选择。
++- 选中 id 后复用 `messageWithParts` 读取该消息的 part，并按既有 assistant `blockIndex` 规则排序；
++  不读取、解码其他消息的 part。
++- 子代理列表把结果包成 `[last]` 或 `[]` 交给状态投影；空结果不得回退到 `messages` 全量读取。
++- 该入口不得用于构造模型历史、resume、fork 或 transcript。child 的完整消息仍由
++  `messages`（例如 `readSubagentTranscript`/resume）读取。
++- 该查询不改变写入、模型历史、事件、状态/摘要规则，不新增表、列或 migration。
+ 
+ ## Runtime 接入契约
+ 
+--- a/apps/zcode-cli/docs/design/v2/tool/07-subagent.md
++++ b/apps/zcode-cli/docs/design/v2/tool/07-subagent.md
+@@ -434,6 +434,12 @@
+ 负责运行期事件排序、live delivery 和进程内 replay。resume 从 session store 读取，不再维护第二份
+ transcript sidecar。
+ 
++子代理目录/状态（V4 `listSessionSubagents`、TUI `readSubagents`）对 child 只读取最后一条 assistant
++消息及其 part（`SessionStorePort.lastAssistantMessage`），用于终态、错误和摘要投影，结果包装成
++`[last]` 或 `[]`；空结果不能回退到 child 全量 `messages`。该读取不是模型历史：resume、fork、
++transcript 和模型请求仍读取完整 `messages`，状态/摘要规则不变。查询顺序与边界见
++[session-persistence](../session-persistence.md#最新-assistant-单条读取子代理列表)。
++
+ ## 权限与副作用
+ 
+ 如果 `Agent` 的只读声明固定为 `true`（理由是它只负责编排，实际副作用由子 agent 调用的底层工具做权限检查），对 tool framework 方便，但对 ZCode 的审计语义不够细。
+--- a/apps/zcode-cli/packages/adapters/src/storage/session-store/repositories/messages.ts
++++ b/apps/zcode-cli/packages/adapters/src/storage/session-store/repositories/messages.ts
+@@ -256,6 +256,30 @@
+     const info = decodeMessageRow(row);
+     return { info, parts: orderAssistantBlockParts(info, partsByMessage.get(row.id) ?? []) };
+   });
++}
++
++/**
++ * 子代理列表/状态只需要 child 的最后一条 assistant。先只查 id，避免把整段 session 正文
++ * 解码进内存；排序是 messages 读取顺序的精确反序（含 NULL sequence 的兜底位置），
++ * 找到后再复用 messageWithParts 只读取这一条消息的 part 和 blockIndex 顺序。
++ * 该读取只服务列表投影，不参与模型历史、resume 或 transcript 重建。
++ */
++export async function lastAssistantMessage(
++  db: DatabaseSync,
++  input: { sessionID: SessionId },
++): Promise<MessageWithParts | null> {
++  const row = db
++    .prepare(
++      `
++      select id from message
++      where session_id = ? and json_extract(data, '$.role') = 'assistant'
++      order by sequence is null desc, sequence desc, time_created desc, rowid desc
++      limit 1
++      `,
++    )
++    .get(input.sessionID) as { id: MessageId } | undefined;
++  if (!row) return null;
++  return messageWithParts(db, { sessionID: input.sessionID, messageID: row.id });
+ }
+ 
+ export async function messageWithParts(
+--- a/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-session-store.ts
++++ b/apps/zcode-cli/packages/adapters/src/storage/session-store/sqlite-session-store.ts
+@@ -784,6 +784,12 @@
+     return messageRepository.messages(this.db, input);
+   }
+ 
++  async lastAssistantMessage(input: {
++    sessionID: SessionId;
++  }): Promise<MessageWithParts | null> {
++    return messageRepository.lastAssistantMessage(this.db, input);
++  }
++
+   async saveSessionEntry(input: SessionEntryInfo): Promise<void> {
+     this.throwBeforeWrite();
+     return sessionEntryRepository.saveSessionEntry(this.db, input);
+--- a/apps/zcode-cli/packages/adapters/tests/session-store.test.ts
++++ b/apps/zcode-cli/packages/adapters/tests/session-store.test.ts
+@@ -10,6 +10,8 @@
+   SESSION_ENTRY_MODEL_SELECTION,
+   SESSION_ENTRY_PROMPT_SNAPSHOT,
+   SESSION_ENTRY_TARGET_COMPLETION_VERIFICATION,
++  STREAM_RECOVERY_DISCARDED_ERROR_NAME,
++  STREAM_RECOVERY_DISCARDED_FINISH,
+   createMessageId,
+   createPartId,
+   createProjectId,
+@@ -197,6 +199,296 @@
+       }
+     },
+   );
++});
++
++describe("latest assistant message at the read boundary", () => {
++  type Store = Awaited<ReturnType<typeof createSqliteSessionStore>>;
++  const CREATED = 1_700_000_000_000;
++
++  async function createTestSession(store: Store, id: string) {
++    const sessionID = createSessionId(id);
++    await store.createSession({
++      id: sessionID,
++      projectID: createProjectId(id),
++      directory: "/workspace",
++      slug: id,
++      title: id,
++      version: "test",
++    });
++    return sessionID;
++  }
++
++  async function saveUser(
++    store: Store,
++    sessionID: SessionId,
++    id: string,
++    created = CREATED,
++  ): Promise<void> {
++    await store.saveMessage({
++      id: createMessageId(id),
++      sessionID,
++      role: "user",
++      time: { created },
++      agent: "zcode-agent",
++    });
++  }
++
++  async function saveAssistant(
++    store: Store,
++    sessionID: SessionId,
++    input: {
++      id: string;
++      created?: number;
++      error?: { name: string; data?: Record<string, unknown> };
++      finish?: string;
++    },
++  ): Promise<void> {
++    await store.saveMessage({
++      id: createMessageId(input.id),
++      sessionID,
++      role: "assistant",
++      time: { created: input.created ?? CREATED, completed: (input.created ?? CREATED) + 1 },
++      parentID: createMessageId(`${input.id}-parent`),
++      modelId: "test-model" as ModelId,
++      providerId: "test-provider" as ModelProviderId,
++      mode: "build",
++      agent: "zcode-agent",
++      path: { cwd: "/workspace", root: "/workspace" },
++      cost: 0,
++      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
++      ...(input.error ? { error: input.error } : {}),
++      ...(input.finish ? { finish: input.finish } : {}),
++    });
++  }
++
++  async function saveTextPart(
++    store: Store,
++    sessionID: SessionId,
++    messageID: string,
++    partID: string,
++    text: string,
++    blockIndex?: number,
++  ): Promise<void> {
++    await store.savePart({
++      id: createPartId(partID),
++      sessionID,
++      messageID: createMessageId(messageID),
++      type: "text",
++      text,
++      ...(blockIndex === undefined ? {} : { blockIndex }),
++    });
++  }
++
++  it("returns null when the session has no assistant message", async () => {
++    const store = await createSqliteSessionStore({ dbPath: ":memory:" });
++    try {
++      const sessionID = await createTestSession(store, "last-assistant-empty");
++      await saveUser(store, sessionID, "only-user");
++      await expect(store.lastAssistantMessage({ sessionID })).resolves.toBeNull();
++      await expect(
++        store.lastAssistantMessage({ sessionID: createSessionId("missing-session") }),
++      ).resolves.toBeNull();
++    } finally {
++      store.close();
++    }
++  });
++
++  it("selects the latest assistant before a trailing user message and reads only its ordered parts", async () => {
++    const tempRoot = await mkdtemp(join(tmpdir(), "zcode-last-assistant-"));
++    const dbPath = join(tempRoot, "session.sqlite");
++    const store = await createSqliteSessionStore({ dbPath });
++    const sessionID = createSessionId("last-assistant-parts");
++    const olderMessageID = "older-assistant";
++    const latestMessageID = "latest-assistant";
++    const largeText = "x".repeat(200_000);
++
++    try {
++      await createTestSession(store, "last-assistant-parts");
++      await saveAssistant(store, sessionID, { id: olderMessageID });
++      await saveTextPart(store, sessionID, olderMessageID, "older-part", "older answer");
++
++      await saveAssistant(store, sessionID, {
++        id: latestMessageID,
++        created: CREATED + 2,
++      });
++      // 物理写入顺序刻意与 blockIndex 不同：step-start 先写，tool 先于 text/reasoning 写入。
++      await store.savePart({
++        id: createPartId("latest-step"),
++        sessionID,
++        messageID: createMessageId(latestMessageID),
++        type: "step-start",
++      });
++      await store.savePart({
++        id: createPartId("latest-tool"),
++        sessionID,
++        messageID: createMessageId(latestMessageID),
++        type: "tool",
++        callID: "latest-tool-call",
++        tool: "Bash",
++        blockIndex: 2,
++        state: {
++          status: "completed",
++          input: {},
++          output: "tool output",
++          title: "Bash",
++          metadata: {},
++          time: { start: CREATED, end: CREATED + 1 },
++        },
++      });
++      await saveTextPart(store, sessionID, latestMessageID, "latest-text", largeText, 0);
++      await store.savePart({
++        id: createPartId("latest-reasoning"),
++        sessionID,
++        messageID: createMessageId(latestMessageID),
++        type: "reasoning",
++        text: "latest reasoning",
++        blockIndex: 1,
++        time: { start: CREATED, end: CREATED + 1 },
++      });
++      // trailing user 是会话最后一条消息；latest assistant 不能因此被跳过。
++      await saveUser(store, sessionID, "trailing-user", CREATED + 3);
++
++      // 无关消息的 part 即使损坏也不能影响目标消息读取（证明只解码选中消息的 part）。
++      const db = new DatabaseSync(dbPath);
++      try {
++        db.prepare("update part set data = ? where id = ?").run("{", createPartId("older-part"));
++      } finally {
++        db.close();
++      }
++
++      const result = await store.lastAssistantMessage({ sessionID });
++
++      expect(result?.info).toMatchObject({
++        id: createMessageId(latestMessageID),
++        role: "assistant",
++      });
++      expect(result?.parts.map((part) => part.id)).toEqual(
++        ["latest-step", "latest-text", "latest-reasoning", "latest-tool"].map((id) =>
++          createPartId(id),
++        ),
++      );
++      expect(result?.parts[1]).toMatchObject({ type: "text", text: largeText });
++      expect(result?.parts[3]).toMatchObject({ type: "tool", tool: "Bash" });
++    } finally {
++      store.close();
++      await rm(tempRoot, { force: true, recursive: true });
++    }
++  });
++
++  it.each([
++    ["error", true, false],
++    ["tool-only", false, true],
++    ["stream-recovery", true, false],
++  ] as const)(
++    "selects the latest %s assistant after a trailing user message",
++    async (kind, withError, withToolPart) => {
++      const store = await createSqliteSessionStore({ dbPath: ":memory:" });
++      const sessionID = await createTestSession(store, `last-assistant-${kind}`);
++      const olderMessageID = "older-variant-assistant";
++      const latestMessageID = "latest-variant-assistant";
++
++      try {
++        await saveAssistant(store, sessionID, { id: olderMessageID });
++        await saveTextPart(store, sessionID, olderMessageID, "older-variant-part", "older");
++        await saveAssistant(store, sessionID, {
++          id: latestMessageID,
++          created: CREATED + 2,
++          ...(withError
++            ? {
++                error:
++                  kind === "stream-recovery"
++                    ? { name: STREAM_RECOVERY_DISCARDED_ERROR_NAME }
++                    : { name: "APIError", data: { message: "provider failed" } },
++              }
++            : {}),
++          ...(kind === "stream-recovery" ? { finish: STREAM_RECOVERY_DISCARDED_FINISH } : {}),
++        });
++        if (withToolPart) {
++          await store.savePart({
++            id: createPartId("latest-variant-tool"),
++            sessionID,
++            messageID: createMessageId(latestMessageID),
++            type: "tool",
++            callID: "latest-variant-call",
++            tool: "Bash",
++            state: {
++              status: "completed",
++              input: {},
++              output: "tool only",
++              title: "Bash",
++              metadata: {},
++              time: { start: CREATED, end: CREATED + 1 },
++            },
++          });
++        } else {
++          await saveTextPart(
++            store,
++            sessionID,
++            latestMessageID,
++            "latest-variant-text",
++            "partial answer",
++          );
++        }
++        await saveUser(store, sessionID, "trailing-variant-user", CREATED + 3);
++
++        const result = await store.lastAssistantMessage({ sessionID });
++        const info = result?.info;
++
++        expect(info).toMatchObject({
++          id: createMessageId(latestMessageID),
++          role: "assistant",
++        });
++        if (withError) {
++          expect(info?.role === "assistant" ? info.error?.name : undefined).toBe(
++            kind === "stream-recovery" ? STREAM_RECOVERY_DISCARDED_ERROR_NAME : "APIError",
++          );
++        }
++        expect(result?.parts).toHaveLength(1);
++        expect(result?.parts[0]?.type).toBe(withToolPart ? "tool" : "text");
++      } finally {
++        store.close();
++      }
++    },
++  );
++
++  it("matches the tail of messages order for a legacy NULL-sequence assistant", async () => {
++    const tempRoot = await mkdtemp(join(tmpdir(), "zcode-last-assistant-null-seq-"));
++    const dbPath = join(tempRoot, "session.sqlite");
++    const store = await createSqliteSessionStore({ dbPath });
++    const sessionID = createSessionId("last-assistant-null-seq");
++
++    try {
++      await createTestSession(store, "last-assistant-null-seq");
++      // NULL 行时间更早，但 messages 读序把它放在非空 sequence 之后；
++      // lastAssistantMessage 必须是该读序的精确反序，因此选中同一条。
++      await saveAssistant(store, sessionID, { id: "null-seq-assistant", created: CREATED });
++      await saveAssistant(store, sessionID, {
++        id: "sequenced-assistant",
++        created: CREATED + 1,
++      });
++      await saveUser(store, sessionID, "null-seq-trailing-user", CREATED + 2);
++
++      const db = new DatabaseSync(dbPath);
++      try {
++        db.prepare("update message set sequence = null where id = ?").run(
++          createMessageId("null-seq-assistant"),
++        );
++      } finally {
++        db.close();
++      }
++
++      const messages = await store.messages({ sessionID });
++      const expectedTail = messages.filter((message) => message.info.role === "assistant").at(-1);
++
++      await expect(store.lastAssistantMessage({ sessionID })).resolves.toMatchObject({
++        info: { id: expectedTail?.info.id },
++      });
++      expect(expectedTail?.info.id).toBe(createMessageId("null-seq-assistant"));
++    } finally {
++      store.close();
++      await rm(tempRoot, { force: true, recursive: true });
++    }
++  });
+ });
+ 
+ describe("virtual project CLI session facts", () => {
+--- a/apps/zcode-cli/packages/bootstrap/src/app/subagent-observation.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/app/subagent-observation.ts
+@@ -56,13 +56,15 @@
+             session.taskType !== "subagent_child"
+           )
+             return null;
+-          const [messages, events] = await Promise.all([
+-            deps.sessionStore.messages({ sessionID: sessionId }),
++          // 目录投影只读 child 的最后一条 assistant；不能降级为 messages 全量读取，
++          // 否则子代理正文会随列表刷新反复解码，且该数据不进入模型历史。
++          const [lastAssistantMessage, events] = await Promise.all([
++            deps.sessionStore.lastAssistantMessage({ sessionID: sessionId }),
+             eventStore.getEvents(sessionId),
+           ]);
+           return {
+             session,
+-            messages,
++            messages: lastAssistantMessage ? [lastAssistantMessage] : [],
+             projection: events.length ? new EventReducer().reduce(events) : undefined,
+           };
+         }),
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts
+@@ -1956,14 +1956,16 @@
+     childSessionIds.map(async (childSessionId) => {
+       const childSession = await store.getSession(childSessionId as SessionId);
+       if (!childSession || childSession.taskType !== "subagent_child") return null;
+-      const childMessages = await store.messages({
++      // 列表投影只消费 child 的最后一条 assistant（lastChildOutcome）。这里不能退回
++      // messages 全量读取：大子代理会话会把全部正文/工具输出解码进内存，且与模型历史无关。
++      const childLastAssistantMessage = await store.lastAssistantMessage({
+         sessionID: childSession.id,
+       });
+       const liveChild = context.sessions.get(childSessionId);
+       const childProjection = liveChild
+         ? await liveChild.app.runtime.getProjection().catch(() => undefined)
+         : undefined;
+-      return { childMessages, childProjection, childSession, childSessionId };
++      return { childLastAssistantMessage, childProjection, childSession, childSessionId };
+     }),
+   );
+   const persistedChildren = childEntries.filter(
+@@ -2001,7 +2003,10 @@
+       persistedChildren.map((entry) => [entry.childSessionId, entry.childSession]),
+     ),
+     childMessagesById: new Map(
+-      persistedChildren.map((entry) => [entry.childSessionId, entry.childMessages]),
++      persistedChildren.map((entry) => [
++        entry.childSessionId,
++        entry.childLastAssistantMessage ? [entry.childLastAssistantMessage] : [],
++      ]),
+     ),
+     childProjectionsById: new Map(
+       persistedChildren.flatMap((entry) =>
+--- a/apps/zcode-cli/packages/bootstrap/tests/subagent-session-query.test.ts
++++ b/apps/zcode-cli/packages/bootstrap/tests/subagent-session-query.test.ts
+@@ -695,7 +695,11 @@
+     expect(rootResolutions).toBe(1);
+   });
+ 
+-  function coldStore(agentId: string, outputDir: string | undefined) {
++  function coldStore(
++    agentId: string,
++    outputDir: string | undefined,
++    childMessages: MessageWithParts[] = [childStuckInTool()],
++  ) {
+     const childSessionId = createSessionId(`subagent_${agentId}`);
+     const parent = session(PARENT_ID, "interactive");
+     const child = { ...session(childSessionId), parentID: PARENT_ID as SessionInfo["id"] };
+@@ -711,19 +715,32 @@
+           }),
+         ],
+       ],
+-      [childSessionId, [childStuckInTool()]],
++      [childSessionId, childMessages],
+     ]);
+     const sessions = new Map<string, SessionInfo>([
+       [PARENT_ID, parent],
+       [childSessionId, child],
+     ]);
++    const messageReads: string[] = [];
++    const lastAssistantReads: string[] = [];
+     return {
+       childSessionId,
++      lastAssistantReads,
++      messageReads,
+       store: {
+         async getSession(id: string) {
+           return sessions.get(id);
+         },
++        async lastAssistantMessage(input: { sessionID: string }) {
++          lastAssistantReads.push(input.sessionID);
++          return (
++            (messages.get(input.sessionID) ?? [])
++              .filter((message) => message.info.role === "assistant")
++              .at(-1) ?? null
++          );
++        },
+         async messages(input: { sessionID: string }) {
++          messageReads.push(input.sessionID);
+           return messages.get(input.sessionID) ?? [];
+         },
+       },
+@@ -768,4 +785,71 @@
+       expect.objectContaining({ childSessionId, status: "cancelled", endedAt: 50 }),
+     ]);
+   });
++
++  function terminalChildMessages(): { latest: MessageWithParts; older: MessageWithParts } {
++    const older = toolMessage({ id: "child-old", output: { result: "old summary" } });
++    const latest = toolMessage({ id: "child-latest", tool: "Bash" });
++    latest.parts = [];
++    latest.info.time.completed = 60;
++    latest.info.error = { name: "APIError", data: { message: "provider exploded" } };
++    return { latest, older };
++  }
++
++  it("reads only the latest assistant message for children in the V4 cold query", async () => {
++    const { latest, older } = terminalChildMessages();
++    const { childSessionId, lastAssistantReads, messageReads, store } = coldStore(
++      "agent-spy",
++      undefined,
++      [older, latest],
++    );
++
++    const result = await listSessionSubagents(
++      { deps: { sessionStore: store }, sessions: new Map() } as never,
++      { sessionId: PARENT_ID, endedLimit: 1 },
++    );
++
++    expect(result.ended.items).toEqual([
++      expect.objectContaining({
++        childSessionId,
++        status: "failed",
++        summary: "provider exploded",
++      }),
++    ]);
++    // parent 仍读全量消息来发现 Agent tool part；child 只允许 lastAssistantMessage，
++    // 不能回退到 messages 全量读取。
++    expect(messageReads).toEqual([PARENT_ID]);
++    expect(lastAssistantReads).toEqual([childSessionId]);
++  });
++
++  it("reads only the latest assistant message for children in the TUI observation", async () => {
++    const { latest, older } = terminalChildMessages();
++    const { childSessionId, lastAssistantReads, messageReads, store } = coldStore(
++      "agent-tui-spy",
++      undefined,
++      [older, latest],
++    );
++    const observation = createSubagentObservation({
++      sessionId: PARENT_ID as never,
++      sessionStore: store as never,
++      runtime: {
++        getSessionEventStore: () => ({
++          getEvents: async () => [],
++          getLatestSequenceNumber: async () => 0,
++        }),
++        getProjection: async () => undefined,
++      } as never,
++    });
++
++    const result = await observation.readSubagents();
++
++    expect(result.ended.items).toEqual([
++      expect.objectContaining({
++        childSessionId,
++        status: "failed",
++        summary: "provider exploded",
++      }),
++    ]);
++    expect(messageReads).toEqual([PARENT_ID]);
++    expect(lastAssistantReads).toEqual([childSessionId]);
++  });
+ });
+--- a/apps/zcode-cli/packages/cli/tests/tui-subagent-observation.test.ts
++++ b/apps/zcode-cli/packages/cli/tests/tui-subagent-observation.test.ts
+@@ -50,6 +50,8 @@
+       id === parentId ? parent : id === childId ? child : undefined,
+     messages: async ({ sessionID }: { sessionID: string }) =>
+       sessionID === parentId ? parentMessages : childMessages,
++    lastAssistantMessage: async ({ sessionID }: { sessionID: string }) =>
++      sessionID === childId ? (childMessages.at(-1) ?? null) : null,
+   } as unknown as SessionStorePort;
+   const runtime = {
+     getSessionEventStore: () => events,
+--- a/apps/zcode-cli/packages/contracts/src/interfaces/session-store.port.ts
++++ b/apps/zcode-cli/packages/contracts/src/interfaces/session-store.port.ts
+@@ -1275,6 +1275,12 @@
+     messageID: MessageId;
+   }): Promise<MessageWithParts | null>;
+   messages(input: { sessionID: SessionId }): Promise<MessageWithParts[]>;
++  /**
++   * 只读按 messages 顺序反序（sequence、time_created、rowid，NULL sequence 在反序中优先）
++   * 的第一条 assistant 消息及其 part；没有 assistant 时为 null。
++   * 用于子代理列表/状态摘要，不能作为模型历史或 resume 的读取入口。
++   */
++  lastAssistantMessage(input: { sessionID: SessionId }): Promise<MessageWithParts | null>;
+   saveSessionEntry?(input: SessionEntryInfo): Promise<void>;
+   sessionEntries?(input: {
+     sessionID: SessionId;
+--- a/apps/zcode-cli/packages/core/tests/runtime-compact.test.ts
++++ b/apps/zcode-cli/packages/core/tests/runtime-compact.test.ts
+@@ -6344,6 +6344,12 @@
+             ),
+         }));
+     },
++    async lastAssistantMessage(input) {
++      return (
++        (await this.messages(input)).filter((message) => message.info.role === "assistant").at(-1) ??
++        null
++      );
++    },
+     async readTodos(input) {
+       return [...(todos.get(input.sessionID) ?? [])];
+     },
+--- a/apps/zcode-cli/packages/core/tests/runtime-persistence.test.ts
++++ b/apps/zcode-cli/packages/core/tests/runtime-persistence.test.ts
+@@ -4662,6 +4662,12 @@
+           ),
+         }));
+     },
++    async lastAssistantMessage(input) {
++      return (
++        (await this.messages(input)).filter((message) => message.info.role === "assistant").at(-1) ??
++        null
++      );
++    },
+     async saveSessionEntry(input) {
+       const index = savedSessionEntries.findIndex((entry) => entry.id === input.id);
+       if (index >= 0) {
+--- a/apps/zcode-cli/packages/core/tests/runtime-tool-loop.test.ts
++++ b/apps/zcode-cli/packages/core/tests/runtime-tool-loop.test.ts
+@@ -15827,6 +15827,15 @@
+     }));
+   }
+ 
++  async lastAssistantMessage(input: {
++    sessionID: SessionId;
++  }): Promise<MessageWithParts | null> {
++    return (
++      (await this.messages(input)).filter((message) => message.info.role === "assistant").at(-1) ??
++      null
++    );
++  }
++
+   async saveSessionEntry(input: SessionEntryInfo): Promise<void> {
+     const entries = this.sessionEntryRecords.get(input.sessionID) ?? [];
+     const index = entries.findIndex((entry) => entry.id === input.id);
+--- a/apps/zcode-cli/packages/core/tests/tool-executor-trace.test.ts
++++ b/apps/zcode-cli/packages/core/tests/tool-executor-trace.test.ts
+@@ -3505,6 +3505,9 @@
+     async messages() {
+       return [];
+     },
++    async lastAssistantMessage() {
++      return null;
++    },
+     async readTodos() {
+       return [];
+     },
