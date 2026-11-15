@@ -504,7 +504,7 @@
            return messages.get(input.sessionID) ?? [];
          },
        },
-@@ -768,4 +785,71 @@
+@@ -768,4 +785,72 @@
        expect.objectContaining({ childSessionId, status: "cancelled", endedAt: 50 }),
      ]);
    });
@@ -513,6 +513,7 @@
 +    const older = toolMessage({ id: "child-old", output: { result: "old summary" } });
 +    const latest = toolMessage({ id: "child-latest", tool: "Bash" });
 +    latest.parts = [];
++    if (latest.info.role !== "assistant") throw new Error("Expected assistant test message");
 +    latest.info.time.completed = 60;
 +    latest.info.error = { name: "APIError", data: { message: "provider exploded" } };
 +    return { latest, older };
