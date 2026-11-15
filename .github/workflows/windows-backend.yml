@@ -8,6 +8,11 @@ on:
       - .github/workflows/windows-backend.yml
       - patches/catalog-last-assistant.patch
   workflow_dispatch:
+    inputs:
+      run_baseline:
+        description: Also rerun the unchanged source baseline
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,7 +29,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        variant: [baseline, catalog-patch]
+        variant: ${{ fromJSON(inputs.run_baseline && '["baseline","catalog-patch"]' || '["catalog-patch"]') }}
     env:
       ZCODE_ENV: production
       HUSKY: "0"
@@ -32,15 +37,15 @@ jobs:
       NODE_OPTIONS: --max-old-space-size=8192
       SOURCE_SHA: fec975905a2abd4c07e35c40d51fa097a2258ec9
     steps:
+      - name: Use repository LF endings on this temporary runner
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Checkout control repository
         uses: actions/checkout@v4
         with:
           path: control
           persist-credentials: false
-
-      - name: Use repository LF endings on this temporary runner
-        shell: pwsh
-        run: git config --global core.autocrlf false
 
       - name: Checkout pinned public source
         uses: actions/checkout@v4
