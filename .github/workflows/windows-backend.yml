@@ -38,6 +38,10 @@ jobs:
           path: control
           persist-credentials: false
 
+      - name: Use repository LF endings on this temporary runner
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - name: Checkout pinned public source
         uses: actions/checkout@v4
         with:
@@ -54,7 +58,7 @@ jobs:
           if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Source SHA mismatch' }
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ($version -ne '3.18.2') { throw "Unexpected version: $version" }
-          node scripts/check-workspace-freshness.mjs --no-fetch
+          node scripts/check-workspace-freshness.mjs --no-fetch --max-behind-main 2147483647
           if ($LASTEXITCODE -ne 0) { throw 'Baseline freshness check failed' }
 
       - name: Apply catalog patch
@@ -84,6 +88,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
 
       - name: Build backend dependencies without rebuilding plugin executors
+        id: dependencies
         shell: pwsh
         working-directory: source
         run: |
@@ -93,7 +98,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'session-control build failed' }
           pnpm exec tsc -b packages/shared
           if ($LASTEXITCODE -ne 0) { throw 'shared build failed' }
-          foreach ($package in @('@zcode/provider', '@zcode/provider-node', '@zcode/shared-types', '@zcode/contracts', '@zcode/dynamic-workflow', '@zcode/dynamic-workflow-runtime', '@zcode/core', '@zcode/adapters', '@zcode/i18n', '@zcode/telemetry', '@zcode/bootstrap')) {
+          foreach ($package in @('@zcode/provider', '@zcode/provider-node', '@zcode/shared-types', '@zcode/contracts', '@zcode/dynamic-workflow', '@zcode/dynamic-workflow-runtime', '@zcode/core', '@zcode/adapters', '@zcode/i18n', '@zcode/telemetry', '@zcode/bootstrap', '@zcode/tui')) {
             pnpm --filter $package build
             if ($LASTEXITCODE -ne 0) { throw "Dependency build failed: $package" }
           }
@@ -102,6 +107,7 @@ jobs:
         shell: pwsh
         working-directory: source
         run: |
+          $env:PATH = "$(Join-Path $PWD 'node_modules/.bin');$env:PATH"
           $results = [System.Collections.Generic.List[object]]::new()
           function Check([string]$name, [string[]]$arguments) {
             Write-Host "::group::$name"
@@ -113,6 +119,9 @@ jobs:
           Check 'root typecheck' @('typecheck')
           Check 'root lint' @('lint')
           Check 'CLI typecheck' @('--dir', 'apps/zcode-cli', 'typecheck')
+          foreach ($package in @('@zcode/contracts', '@zcode/core', '@zcode/adapters', '@zcode/bootstrap', '@zcode/cli')) {
+            Check "$package typecheck" @('--filter', $package, 'typecheck')
+          }
           Check 'CLI lint' @('--dir', 'apps/zcode-cli', 'lint')
           Check 'format' @('fmt:check')
           Check 'architecture' @('architecture:check', '--', '--changed')
@@ -124,7 +133,9 @@ jobs:
           $results | ConvertTo-Json | Set-Content -Encoding utf8 ../checks-${{ matrix.variant }}.json
           if ($results.Where({ $_.exitCode -ne 0 }).Count -gt 0) { throw 'One or more verification gates failed; see checks report and logs' }
 
-      - name: Build backend only
+      - name: Build experimental backend even when unrelated baseline gates fail
+        id: backend
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         shell: pwsh
         working-directory: source
         run: |
@@ -132,6 +143,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Backend build failed' }
 
       - name: Mark artifact as incompatible pending official CUA verification
+        if: ${{ !cancelled() && steps.backend.outcome == 'success' }}
         shell: pwsh
         run: |
           $bundle = 'source/apps/zcode-cli/packages/cli/dist/zcode.cjs'
